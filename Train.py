@@ -15,6 +15,7 @@ from tensorboardX import SummaryWriter
 from lib.Network import Network
 from utils.data_val import get_loader, test_dataset
 from utils.utils import clip_gradient, get_coef, cal_ual
+from utils.polyp_utils import get_dataset_prior
 
 
 # -----------------------------
@@ -244,26 +245,39 @@ def batch_soft_iou_from_logits(logits, gts, eps=1e-6):
 
 
 @torch.no_grad()
-def compute_difficulty_by_model(model, full_loader, device, final_idx=4):
-    """
-    difficulty = 1 - soft IoU
+def compute_difficulty_by_model(model, full_loader, device, final_idx=4, prior_weight=None):
+    """PolypCurriSeg 难度分数：时间统计/模型误差与医学域先验联合。
+
+    先验编码低对比度、边界模糊和边界复杂度，并对反光高亮干扰样本扣分。
     """
     model.eval()
     d_map = {}
+    if prior_weight is None:
+        prior_weight = float(getattr(globals().get('opt', None), 'prior_weight', 0.35))
+    prior_weight = float(np.clip(prior_weight, 0.0, 1.0))
+    dataset = full_loader.dataset
+    old_augment = getattr(dataset, 'augment', None)
+    if old_augment is not None:
+        dataset.augment = False
+    try:
+        for images, gts, edges, idxs in full_loader:
+            images = images.to(device, non_blocking=True)
+            gts = gts.to(device, non_blocking=True)
 
-    for images, gts, edges, idxs in full_loader:
-        images = images.to(device, non_blocking=True)
-        gts = gts.to(device, non_blocking=True)
+            preds = model(images)
+            iou = batch_soft_iou_from_logits(preds[final_idx], gts)
+            model_error = 1.0 - iou  # [B]
 
-        preds = model(images)
-        iou = batch_soft_iou_from_logits(preds[final_idx], gts)
-        d = 1.0 - iou  # [B]
+            if torch.is_tensor(idxs):
+                idxs = idxs.detach().cpu().tolist()
 
-        if torch.is_tensor(idxs):
-            idxs = idxs.detach().cpu().tolist()
-
-        for j, idx in enumerate(idxs):
-            d_map[int(idx)] = float(d[j].item())
+            for j, idx in enumerate(idxs):
+                prior = get_dataset_prior(dataset, int(idx))
+                # 模型动态误差占主导，医学先验用于稳定排序并抑制反光噪声。
+                d_map[int(idx)] = float((1.0 - prior_weight) * model_error[j].item() + prior_weight * prior)
+    finally:
+        if old_augment is not None:
+            dataset.augment = old_augment
 
     return d_map
 
@@ -516,7 +530,7 @@ def train_with_curriculum_learning(
             shuffle=True,
             num_workers=num_workers,
             pin_memory=True,
-            drop_last=True,
+            drop_last=False,
         )
 
         print(f"[Curriculum] epoch={epoch:03d} |S_t|={len(active_indices)}/{dataset_size} (monotonic union)")
@@ -602,10 +616,11 @@ def train_with_curriculum_learning(
         loss_init = (loss_init_vec * omega_batch).mean()
         loss_final = (loss_final_vec * omega_batch).mean()
 
-        # ---- Edge loss (unchanged, as requested) ----
-        loss_edge = (dice_loss(preds[5], edges) * 0.125 +
-                     dice_loss(preds[6], edges) * 0.25 +
-                     dice_loss(preds[7], edges) * 0.5)
+        # ---- 四个尺度的边界监督 ----
+        loss_edge = (dice_loss(preds[5], edges) * 0.0625 +
+                     dice_loss(preds[6], edges) * 0.125 +
+                     dice_loss(preds[7], edges) * 0.25 +
+                     dice_loss(preds[8], edges) * 0.5)
 
         # ---- total loss ----
         loss = loss_init + loss_final + loss_edge + 2.0 * ual_loss
@@ -697,9 +712,9 @@ if __name__ == '__main__':
     parser.add_argument('--gpu_id', type=str, default='0', help='train use gpu')
 
     parser.add_argument('--train_root', type=str, default='',
-                        help='training dataset root (contains Imgs/ GT/ Edge/)')
+                        help='息肉训练集目录（包含 Imgs/ 和 GT/，Edge/ 可省略）')
     parser.add_argument('--val_root', type=str, default='',
-                        help='validation dataset root (contains Imgs/ GT/)')
+                        help='息肉验证集目录（包含 Imgs/ 和 GT/）')
     parser.add_argument('--save_path', type=str,
                         default='',
                         help='path to save model and log')
@@ -722,6 +737,8 @@ if __name__ == '__main__':
     # -------- PUE params --------
     parser.add_argument('--pue_wmin', type=float, default=0.1, help='PUE min pixel weight')
     parser.add_argument('--pue_Tc', type=int, default=200, help='PUE curriculum length Tc (epochs)')
+    parser.add_argument('--prior_weight', type=float, default=0.35,
+                        help='息肉医学域先验权重；设为 0 可做无先验基线')
 
     opt = parser.parse_args()
 
@@ -739,17 +756,17 @@ if __name__ == '__main__':
         datefmt='%Y-%m-%d %I:%M:%S %p'
     )
 
-    logging.info('Network-Train (CurriSeg Union + TSSW + PUE)')
+    logging.info('PolypCurriSeg 阶段一：RCS + TSSW + PUE')
     logging.info(
         'Config: epoch: {}; lr: {}; batchsize: {}; trainsize: {}; clip: {}; '
         'K: {}; burnin_epochs: {}; train_root: {}; val_root: {}; save_path: {}; '
         'tssw_K: {}; tssw_wmin: {}; tssw_sigma_star: {}; tssw_gamma: {}; '
-        'pue_wmin: {}; pue_Tc: {}'.format(
+        'pue_wmin: {}; pue_Tc: {}; prior_weight: {}'.format(
             opt.epoch, opt.lr, opt.batchsize, opt.trainsize, opt.clip,
             opt.K, opt.burnin_epochs,
             opt.train_root, opt.val_root, save_path,
             opt.tssw_K, opt.tssw_wmin, opt.tssw_sigma_star, opt.tssw_gamma,
-            opt.pue_wmin, opt.pue_Tc
+            opt.pue_wmin, opt.pue_Tc, opt.prior_weight
         )
     )
 

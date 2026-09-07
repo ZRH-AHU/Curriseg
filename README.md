@@ -1,163 +1,89 @@
-# CurriSeg
+# PolypCurriSeg
 
-**Refining Context-Entangled Content Segmentation via Curriculum Selection and Anti-Curriculum Promotion**, ICML 2026
+这是一个以息肉图像分割为主线的 CurriSeg 改造版。方法保持轻量主干和两阶段训练：
 
-[[Project Page](https://zrh-ahu.github.io/Curriseg/)] [[Paper](assets/paper.pdf)] [[Pretrained models](https://drive.google.com/drive/folders/1lxplDrCk84zgB-FQaJAvxcvyKBGenqA_?usp=sharing)]
+1. **阶段 1：Robust Curriculum Selection（RCS）**。用样本损失/IoU 的时间统计选择样本，并加入息肉医学域先验：低对比度、边界模糊、边界复杂度。反光高亮作为干扰项扣分，避免把反光噪声误当成有价值难例。
+2. **阶段 2：Anti-curriculum + EPSB**。在模型最难子集上微调。EPSB 使用 FFT 低通/高频分解，在预测或标注边界带内保留高频，在边界带外抑制纹理高频，避免息肉轮廓变糊。EPSB 只在训练时使用，不增加推理参数。
 
-#### Authors
-[Chunming He](https://chunminghe.github.io/)\*, Rihan Zhang\*, Fengyang Xiao†, Dingming Zhang, Zhiwen Cao, Sina Farsiu†
+代码不声称临床有效性，建议把实验主张限定为跨数据集/跨设备泛化、边界质量和小显存可复现性。
 
-\* Equal contribution. † Corresponding authors.
+## 数据目录
 
-#### Affiliations
-Duke University, Adobe
+将任意公开数据集整理成以下结构；`Edge/` 可以省略，代码会从 GT 自动生成边界监督。
 
----
-
-> **Abstract:** *Biological learning proceeds from easy to difficult tasks, gradually reinforcing perception and robustness. Inspired by this principle, we address Context-Entangled Content Segmentation (CECS), a challenging setting where objects share intrinsic visual patterns with their surroundings, as in camouflaged object detection. Conventional segmentation networks predominantly rely on architectural enhancements but often ignore the learning dynamics that govern robustness under entangled data distributions. We introduce CurriSeg, a dual-phase learning framework that unifies curriculum and anti-curriculum principles to improve representation reliability. In the Curriculum Selection phase, CurriSeg dynamically selects training data based on the temporal statistics of sample losses, distinguishing hard-but-informative samples from noisy or ambiguous ones, thus enabling stable capability enhancement. In the Anti-Curriculum Promotion phase, we design Spectral-Blindness Fine-Tuning, which suppresses high-frequency components to enforce dependence on low-frequency structural and contextual cues and thus strengthens generalization. Extensive experiments demonstrate that CurriSeg achieves consistent improvements across diverse CECS benchmarks without adding parameters or increasing total training time, offering a principled view of how progression and challenge interplay to foster robust and context-aware segmentation.*
-
-<p align="center">
-  <img width="900" src="assets/framework.png" alt="CurriSeg framework">
-</p>
-
----
-
-## Highlights
-
-- **CurriSeg** is a dual-phase learning framework for Context-Entangled Content Segmentation (CECS).
-- **Robust Curriculum Selection (RCS)** stabilizes training with temporal sample statistics and pixel-level uncertainty estimation.
-- **Anti-Curriculum Promotion (ACP)** improves robustness through Spectral-Blindness Fine-Tuning (SBFT), encouraging low-frequency structural reasoning.
-- The framework improves diverse CECS benchmarks without introducing extra inference parameters.
-
-## Visual Comparison
-
-<p align="center">
-  <img width="1000" src="assets/visual_compare.png" alt="CurriSeg visual comparison">
-</p>
-
-## Usage
-
-### 1. Prerequisites
-
-> CurriSeg is developed with PyTorch and tested for research use on GPU environments.
-
-- Create a virtual environment:
-
-```bash
-conda create -n curriseg python=3.8
-conda activate curriseg
+```text
+dataset_root/
+  Imgs/                 # RGB 图像，jpg/png/jpeg/bmp/tif 均可
+  GT/                   # 二值掩码，与图像文件名 stem 对齐
+  Edge/                 # 可选；已有边界标签时放在这里
 ```
 
-- Install dependencies:
+图像和 GT 的文件名 stem 应一致，例如 `Imgs/0001.jpg` 对应 `GT/0001.png`。
+
+## 安装
 
 ```bash
+conda create -n polypcurriseg python=3.10
+conda activate polypcurriseg
 pip install -r requirements.txt
 ```
 
-### 2. Downloading Training and Testing Datasets
+## 训练
 
-- Prepare the training set with the following structure:
-
-```text
-YOUR_TRAININGSETPATH/
-  Imgs/
-  GT/
-  Edge/
-```
-
-- Prepare the validation and testing sets with the following structure:
-
-```text
-YOUR_VALIDATIONSETPATH/
-  Imgs/
-  GT/
-
-YOUR_TESTINGSETPATH/
-  CAMO/
-    Imgs/
-    GT/
-  COD10K/
-    Imgs/
-    GT/
-  CHAMELEON/
-    Imgs/
-    GT/
-  NC4K/
-    Imgs/
-    GT/
-```
-
-Common CECS/COD benchmarks can be obtained from their official project pages or the [awesome-concealed-object-segmentation](https://github.com/ChunmingHe/awesome-concealed-object-segmentation) collection.
-
-### 3. Training Configuration
-
-Run the curriculum selection phase:
+阶段 1（RCS）：
 
 ```bash
 python Train.py \
-  --train_root YOUR_TRAININGSETPATH \
-  --val_root YOUR_VALIDATIONSETPATH \
-  --save_path YOUR_CHECKPOINTPATH
+  --train_root D:/data/Kvasir-SEG/train \
+  --val_root D:/data/Kvasir-SEG/val \
+  --save_path runs/kvasir_rcs \
+  --trainsize 384 --batchsize 8 --num_workers 4
 ```
 
-Run the anti-curriculum promotion phase:
+显存只有 8--12 GB 时，优先把 `--batchsize` 调到 2--8。训练期间会在 `save_path` 保存难度映射和 TSSW 时间统计。
+
+阶段 2（hard-subset + EPSB）：
 
 ```bash
 python anti_curri_stage.py \
-  --train_root YOUR_TRAININGSETPATH \
-  --val_root YOUR_VALIDATIONSETPATH \
-  --save_path YOUR_ANTI_CURRI_CHECKPOINTPATH \
-  --load YOUR_CHECKPOINTPATH/Net_epoch_best.pth \
-  --use_sbft
+  --train_root D:/data/Kvasir-SEG/train \
+  --val_root D:/data/Kvasir-SEG/val \
+  --save_path runs/kvasir_epsb \
+  --load runs/kvasir_rcs/Net_epoch_best.pth \
+  --trainsize 384 --batchsize 8 --hard_ratio 0.2 \
+  --epsb_prob 0.7 --epsb_cutoff 0.18 --epsb_suppress 0.75
 ```
 
-### 4. Testing Configuration
+消融：`--no_epsb` 关闭 EPSB；`--epsb_no_pred_boundary` 只用 GT 边界；将 `--hard_ratio 1.0` 可近似关闭 hard-subset；阶段 1/2 的 `--prior_weight 0` 可得到不使用医学域先验的基线。
 
-The pretrained models are available on [Google Drive](https://drive.google.com/drive/folders/1lxplDrCk84zgB-FQaJAvxcvyKBGenqA_?usp=sharing). After downloading a checkpoint, run:
+## 测试
 
 ```bash
 python Test.py \
-  --pth_path YOUR_CHECKPOINTPATH/Net_epoch_best.pth \
-  --test_dataset_path YOUR_TESTINGSETPATH
+  --pth_path runs/kvasir_epsb/Net_epoch_best.pth \
+  --test_image_root D:/data/Kvasir-SEG/test/Imgs \
+  --test_gt_root D:/data/Kvasir-SEG/test/GT \
+  --save_path runs/kvasir_epsb/predictions
 ```
 
-### 5. Evaluation
+`Test.py` 输出每张预测图和 MAE。论文实验建议额外计算 Dice、IoU、S-measure、F-measure、Hausdorff 距离/ASSD，以及边界 F-score 或 trimap IoU。
 
-One-key evaluation for COD/CECS benchmarks can be performed with the public [CODToolbox](https://github.com/DengPingFan/CODToolbox). Please follow the instructions in `main.m` to compute standard metrics.
+## 建议的公开息肉数据集
 
-<a id="pretrained-models"></a>
+- **[Kvasir-SEG](https://datasets.simula.no/kvasir-seg/)**：1000 张带像素级掩码的胃肠息肉图像，适合主训练集或常规验证。
+- **[CVC-ClinicDB（CVC-612）](https://polyp.grand-challenge.org/CVCClinicDB/)**：612 张、来自多段结肠镜序列，适合跨中心/跨设备测试。
+- **[ETIS-LaribPolypDB](https://polyp.grand-challenge.org/EtisLarib/)**：独立实验室采集的小规模测试集，常用于检验跨数据集泛化。
+- **[CVC-ColonDB](https://pages.cvc.uab.es/CVC-Colon/index.php/databases/)**：经典独立测试集，适合与 CVC-ClinicDB 组合做域外评估。
+- **[CVC-300 / EndoScene](http://adas.cvc.uab.es/endoscene)**：EndoScene 中的 CVC-300 子集，常用于外部测试。
+- **[SUN-SEG](https://github.com/Gewtial/SUN-SEG)**：大规模结肠镜视频息肉分割基准，包含 seen/unseen、easy/hard 划分，适合视频帧和跨域泛化分析。
+- **[PolypGen](https://github.com/DebeshJha/PolypGen)**：多中心、多序列数据，适合研究中心间域偏移；使用前请按官方许可和标注协议整理分割子集。
 
-### 6. Pretrained Models
+建议至少采用“一个数据集训练、其余数据集完全不参与训练”的协议，例如 Kvasir-SEG 训练，CVC-ClinicDB、CVC-ColonDB、ETIS、CVC-300、SUN-SEG 做外部测试；不要把不同数据集的相邻视频帧随机混到训练和测试中。
 
-Pretrained models are available on [Google Drive](https://drive.google.com/drive/folders/1lxplDrCk84zgB-FQaJAvxcvyKBGenqA_?usp=sharing).
+## 代码对应关系
 
-## Related Works
-
-1. [Camouflaged Object Detection with Feature Decomposition and Edge Reconstruction](https://github.com/ChunmingHe/FEDER), CVPR 2023.
-
-2. [RUN: Reversible Unfolding Network for Concealed Object Segmentation](https://github.com/ChunmingHe/RUN), ICML 2025.
-
-3. [Frequency-Spatial Entanglement Learning for Camouflaged Object Detection](https://github.com/CSYSI/FSEL), ECCV 2024.
-
-You can find more related papers in [awesome-concealed-object-segmentation](https://github.com/ChunmingHe/awesome-concealed-object-segmentation).
-
-## Citation
-
-If you find our work useful in your research, please consider citing:
-
-```bibtex
-@inproceedings{he2026curriseg,
-  title={Refining Context-Entangled Content Segmentation via Curriculum Selection and Anti-Curriculum Promotion},
-  author={He, Chunming and Zhang, Rihan and Xiao, Fengyang and Zhang, Dingming and Cao, Zhiwen and Farsiu, Sina},
-  booktitle={International Conference on Machine Learning (ICML)},
-  year={2026}
-}
-```
-
-## Contact
-
-If you have any questions, please contact us via email at chunminghe19990224@gmail.com or chunming.he@duke.edu.
-
-## Acknowledgement
-
-This repository follows the research code style of prior CECS/COD projects such as [FEDER](https://github.com/ChunmingHe/FEDER), [RUN](https://github.com/ChunmingHe/RUN), and related open-source segmentation frameworks. We sincerely thank the authors for their valuable contributions to the community.
+- `Train.py`：阶段 1，时间统计 + 医学域难度先验的课程选择。
+- `anti_curri_stage.py`：阶段 2，hard-subset 和 EPSB 频域微调。
+- `utils/polyp_utils.py`：息肉难度先验和边界保护频率门控。
+- `utils/data_val.py`：图像/GT 配对、增强和自动边界监督。
+- `Test.py`：单一图像目录/GT 目录的批量推理。

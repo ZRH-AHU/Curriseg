@@ -7,6 +7,9 @@ import numpy as np
 from PIL import ImageEnhance
 import torch
 import cv2
+from pathlib import Path
+
+from utils.polyp_utils import polyp_difficulty_prior
 
 
 
@@ -34,12 +37,11 @@ def randomCrop(image, label, edge):
 
 
 def randomRotation(image, label, edge):
-    mode = Image.BICUBIC
     if random.random() > 0.8:
         random_angle = np.random.randint(-15, 15)
-        image = image.rotate(random_angle, mode)
-        label = label.rotate(random_angle, mode)
-        edge = edge.rotate(random_angle, mode)
+        image = image.rotate(random_angle, Image.BICUBIC)
+        label = label.rotate(random_angle, Image.NEAREST)
+        edge = edge.rotate(random_angle, Image.NEAREST)
     return image, label, edge
 
 
@@ -89,14 +91,31 @@ def randomPeper(img):
 
 # dataset for training
 class PolypObjDataset(data.Dataset):
-    def __init__(self, image_root, gt_root, edge_root, trainsize):
+    """息肉分割数据集，边界标签可选或由二值 GT 自动生成。
+
+    公开息肉数据集常见多种后缀，而且通常只提供图像和掩码目录，因此
+    edge_root 可以省略；省略时在读取样本时从 GT 生成边界监督。
+    """
+    def __init__(self, image_root, gt_root, edge_root=None, trainsize=384):
         self.trainsize = trainsize
-        self.images = [image_root + f for f in os.listdir(image_root) if f.endswith('.jpg')]
-        self.gts = [gt_root + f for f in os.listdir(gt_root) if f.endswith('.jpg') or f.endswith('.png')]
-        self.edges = [edge_root + f for f in os.listdir(edge_root) if f.endswith('.jpg') or f.endswith('.png')]
-        self.images = sorted(self.images)
-        self.gts = sorted(self.gts)
-        self.edges = sorted(self.edges)
+        self.augment = True
+        image_exts = {'.jpg', '.jpeg', '.png', '.bmp', '.tif', '.tiff'}
+        gt_exts = image_exts
+        image_files = sorted([p for p in Path(image_root).iterdir() if p.suffix.lower() in image_exts])
+        gt_files = {p.stem: p for p in Path(gt_root).iterdir() if p.suffix.lower() in gt_exts}
+        gt_sorted = sorted(gt_files.values())
+        self.images, self.gts = [], []
+        for pos, image_path in enumerate(image_files):
+            gt_path = gt_files.get(image_path.stem)
+            if gt_path is None and pos < len(gt_sorted):
+                gt_path = gt_sorted[pos]
+            if gt_path is not None:
+                self.images.append(str(image_path))
+                self.gts.append(str(gt_path))
+        edge_map = {}
+        if edge_root and os.path.isdir(edge_root):
+            edge_map = {p.stem: p for p in Path(edge_root).iterdir() if p.suffix.lower() in image_exts}
+        self.edges = [str(edge_map[p.stem]) if p.stem in edge_map else None for p in map(Path, self.images)]
         self.filter_files()
         self.img_transform = transforms.Compose([
             transforms.Resize((self.trainsize, self.trainsize)),
@@ -116,18 +135,19 @@ class PolypObjDataset(data.Dataset):
     def __getitem__(self, index):
         image = self.rgb_loader(self.images[index])
         gt = self.binary_loader(self.gts[index])
-        edge = cv2.imread(self.edges[index], cv2.IMREAD_GRAYSCALE)
+        if self.edges[index] is None:
+            gt_np = np.asarray(gt, dtype=np.uint8)
+            edge = cv2.morphologyEx(gt_np, cv2.MORPH_GRADIENT, self.kernel)
+        else:
+            edge = cv2.imread(self.edges[index], cv2.IMREAD_GRAYSCALE)
         edge = cv2.dilate(edge, self.kernel, iterations=1)
         edge = Image.fromarray(edge)  
 
-        image, gt, edge = cv_random_flip(image, gt, edge)
-        image, gt, edge = randomCrop(image, gt, edge)
-        image, gt, edge = randomRotation(image, gt, edge)
-
-        image = colorEnhance(image)
-        gt = randomPeper(gt)
-        edge = randomPeper(edge)
-
+        if self.augment:
+            image, gt, edge = cv_random_flip(image, gt, edge)
+            image, gt, edge = randomCrop(image, gt, edge)
+            image, gt, edge = randomRotation(image, gt, edge)
+            image = colorEnhance(image)
         image = self.img_transform(image)
         gt = self.gt_transform(gt)
         edge = self.edge_transform(edge)
@@ -138,22 +158,32 @@ class PolypObjDataset(data.Dataset):
         return image, gt, edge_small,index
 
     def filter_files(self):
-        assert len(self.images) == len(self.gts) and len(self.edges) == len(self.images) \
-               and len(self.edges) == len(self.gts)
         images = []
         gts = []
         edges = []
         for img_path, gt_path, edge_path in zip(self.images, self.gts, self.edges):
             img = Image.open(img_path)
             gt = Image.open(gt_path)
-            edge = Image.open(edge_path)
-            if img.size == gt.size and img.size == edge.size:
+            edge_ok = edge_path is None or Image.open(edge_path).size == img.size
+            if img.size == gt.size and edge_ok:
                 images.append(img_path)
                 gts.append(gt_path)
                 edges.append(edge_path)
         self.images = images
         self.gts = gts
         self.edges = edges
+        self.difficulty_priors = {
+            i: polyp_difficulty_prior(img, gt)
+            for i, (img, gt) in enumerate(zip(self.images, self.gts))
+        }
+        if self.difficulty_priors:
+            p = np.array([x['prior'] for x in self.difficulty_priors.values()], dtype=np.float32)
+            print('[PolypPrior] mean={:.3f} low-contrast={:.3f} blurred-boundary={:.3f} specular={:.3f}'.format(
+                float(p.mean()),
+                float(np.mean([x['low_contrast'] for x in self.difficulty_priors.values()])),
+                float(np.mean([x['blurred_boundary'] for x in self.difficulty_priors.values()])),
+                float(np.mean([x['specular_ratio'] for x in self.difficulty_priors.values()])),
+            ))
 
     def rgb_loader(self, path):
         with open(path, 'rb') as f:
@@ -179,7 +209,7 @@ def seed_worker(worker_id):
     np.random.seed(worker_seed)
 
 # dataloader for training
-def get_loader(image_root, gt_root, edge_root, batchsize, trainsize, shuffle=True, num_workers=12, pin_memory=True):
+def get_loader(image_root, gt_root, edge_root=None, batchsize=4, trainsize=384, shuffle=True, num_workers=12, pin_memory=True):
     dataset = PolypObjDataset(image_root, gt_root, edge_root, trainsize)
     data_loader = data.DataLoader(dataset=dataset,
                                   batch_size=batchsize,
@@ -195,8 +225,18 @@ class test_dataset:
     def __init__(self, image_root, gt_root, testsize):
         self.testsize = testsize
 
-        self.images = [image_root + f for f in os.listdir(image_root) if f.endswith('.jpg') or f.endswith('.png')]
-        self.gts = [gt_root + f for f in os.listdir(gt_root) if f.endswith('.tif') or f.endswith('.png')]
+        exts = {'.jpg', '.jpeg', '.png', '.bmp', '.tif', '.tiff'}
+        image_files = [p for p in sorted(Path(image_root).iterdir()) if p.suffix.lower() in exts]
+        gt_files = {p.stem: p for p in Path(gt_root).iterdir() if p.suffix.lower() in exts}
+        gt_sorted = sorted(gt_files.values())
+        self.images, self.gts = [], []
+        for pos, image_path in enumerate(image_files):
+            gt_path = gt_files.get(image_path.stem)
+            if gt_path is None and pos < len(gt_sorted):
+                gt_path = gt_sorted[pos]
+            if gt_path is not None:
+                self.images.append(str(image_path))
+                self.gts.append(str(gt_path))
         self.images = sorted(self.images)
         self.gts = sorted(self.gts)
         
@@ -215,7 +255,7 @@ class test_dataset:
 
         gt = self.binary_loader(self.gts[self.index])
 
-        name = self.images[self.index].split('/')[-1]
+        name = Path(self.images[self.index]).name
 
         image_for_post = self.rgb_loader(self.images[self.index])
         image_for_post = image_for_post.resize(gt.size)
@@ -240,24 +280,3 @@ class test_dataset:
 
     def __len__(self):
         return self.size
-
-
-if __name__ =='__main__':
-    train_root = '/dataset/COD/TrainDataset/'
-    batchsize = 36
-    trainsize = 512
-    train_loader = get_loader(image_root=train_root + 'Imgs/',
-                              gt_root=train_root + 'GT/',
-                              edge_root=train_root + 'Edge/',
-                              batchsize=batchsize,
-                              trainsize=trainsize,
-                              num_workers=8)
-    for i, (images, gts, edges) in enumerate(train_loader, start=1):
-        gt = gts[0].sigmoid().data.cpu().numpy().squeeze()
-        edge =edges[0].sigmoid().data.cpu().numpy().squeeze()
-        print(edge.shape)
-        res_gt = (gt - gt.min()) / (gt.max() - gt.min() + 1e-8)
-        cv2.imwrite('ceshi_gt.png',res_gt*255)
-        res = (edge - edge.min()) / (edge.max() - edge.min() + 1e-8)
-        cv2.imwrite('ceshi_edge.png',res*255)
-        break

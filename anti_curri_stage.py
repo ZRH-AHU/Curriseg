@@ -1,24 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-"""
-Anti-Curriculum Fine-tuning Stage (Standalone Script)
-=====================================================
-
-✅ Purpose:
-- Load your trained model (e.g., bestMAE ~ 0.031)
-- Compute difficulty = 1 - softIoU on FULL training set
-- Select HARDEST top hard_ratio samples
-- Fine-tune model only on these hard samples (Anti-curriculum)
-- (Optional) SBFT: low-pass blur to suppress high-frequency shortcut
-- Validate every epoch & save best checkpoint
-
-This script is standalone: it DOES NOT include curriculum selection stage.
-It assumes your repo already has:
-  - lib/Network.py  -> Network
-  - utils/data_val.py -> get_loader, test_dataset
-  - utils/utils.py -> clip_gradient, get_coef, cal_ual
-"""
+"""PolypCurriSeg 第二阶段：难例子集反课程微调与 EPSB。"""
 
 import os
 import logging
@@ -35,6 +18,7 @@ from tensorboardX import SummaryWriter
 from lib.Network import Network
 from utils.data_val import get_loader, test_dataset
 from utils.utils import clip_gradient, get_coef, cal_ual
+from utils.polyp_utils import boundary_protected_frequency_gate, get_dataset_prior
 
 
 # -----------------------------
@@ -91,27 +75,39 @@ def batch_soft_iou_from_logits(logits, gts, eps=1e-6):
 
 
 @torch.no_grad()
-def compute_difficulty_by_model(model, full_loader, device, final_idx=4):
-    """
-    difficulty = 1 - softIoU
-    return: dict idx -> difficulty
+def compute_difficulty_by_model(model, full_loader, device, final_idx=4, prior_weight=None):
+    """计算 PolypCurriSeg 难例分数：模型误差加确定性的医学域先验。
+
+    先验包含低对比度、边界模糊和边界复杂度，反光干扰已在先验中降权。
+    返回值为样本索引到难度的映射。
     """
     model.eval()
     d_map = {}
+    if prior_weight is None:
+        prior_weight = float(getattr(globals().get('opt', None), 'prior_weight', 0.35))
+    prior_weight = float(np.clip(prior_weight, 0.0, 1.0))
+    dataset = full_loader.dataset
+    old_augment = getattr(dataset, 'augment', None)
+    if old_augment is not None:
+        dataset.augment = False
+    try:
+        for images, gts, edges, idxs in full_loader:
+            images = images.to(device, non_blocking=True)
+            gts = gts.to(device, non_blocking=True)
 
-    for images, gts, edges, idxs in full_loader:
-        images = images.to(device, non_blocking=True)
-        gts = gts.to(device, non_blocking=True)
+            preds = model(images)
+            iou = batch_soft_iou_from_logits(preds[final_idx], gts)
+            d = 1.0 - iou
 
-        preds = model(images)
-        iou = batch_soft_iou_from_logits(preds[final_idx], gts)
-        d = 1.0 - iou
+            if torch.is_tensor(idxs):
+                idxs = idxs.detach().cpu().tolist()
 
-        if torch.is_tensor(idxs):
-            idxs = idxs.detach().cpu().tolist()
-
-        for j, idx in enumerate(idxs):
-            d_map[int(idx)] = float(d[j].item())
+            for j, idx in enumerate(idxs):
+                prior = get_dataset_prior(dataset, int(idx))
+                d_map[int(idx)] = float((1.0 - prior_weight) * d[j].item() + prior_weight * prior)
+    finally:
+        if old_augment is not None:
+            dataset.augment = old_augment
 
     return d_map
 
@@ -169,41 +165,6 @@ def select_hardest_subset(d_map, hard_ratio=0.2):
 
 
 # -----------------------------
-# SBFT (Low-pass blur in spatial domain)
-# -----------------------------
-def gaussian_kernel1d(kernel_size: int, sigma: float, device):
-    """Create 1D Gaussian kernel"""
-    x = torch.arange(kernel_size, device=device).float() - (kernel_size - 1) / 2
-    kernel = torch.exp(-0.5 * (x / sigma) ** 2)
-    kernel = kernel / (kernel.sum() + 1e-8)
-    return kernel
-
-
-def lowpass_blur(images, kernel_size=11, sigma=3.0):
-    """
-    Simple Gaussian blur (separable conv) as low-pass filter.
-    images: [B,C,H,W]
-    """
-    device = images.device
-    B, C, H, W = images.shape
-    k1d = gaussian_kernel1d(kernel_size, sigma, device=device)
-
-    # [1,1,k,1] and [1,1,1,k]
-    kx = k1d.view(1, 1, kernel_size, 1)
-    ky = k1d.view(1, 1, 1, kernel_size)
-
-    # apply per-channel (groups=C)
-    # first vertical then horizontal
-    images = F.pad(images, (0, 0, kernel_size // 2, kernel_size // 2), mode="reflect")
-    images = F.conv2d(images, kx.expand(C, 1, kernel_size, 1), groups=C)
-
-    images = F.pad(images, (kernel_size // 2, kernel_size // 2, 0, 0), mode="reflect")
-    images = F.conv2d(images, ky.expand(C, 1, 1, kernel_size), groups=C)
-
-    return images
-
-
-# -----------------------------
 # Validation (SAME STYLE)
 # -----------------------------
 def val(test_loader, model, epoch, save_path, writer):
@@ -254,10 +215,12 @@ def train_one_epoch_anti_curri(
     optimizer,
     epoch,
     writer,
-    use_sbft=False,
-    sbft_prob=0.7,
-    sbft_kernel=11,
-    sbft_sigma=3.0,
+    use_epsb=True,
+    epsb_prob=0.7,
+    epsb_cutoff=0.18,
+    epsb_suppress=0.75,
+    epsb_boundary_width=2,
+    epsb_use_pred_boundary=True,
 ):
     global step
 
@@ -275,9 +238,22 @@ def train_one_epoch_anti_curri(
         gts = gts.to(device, non_blocking=True)
         edges = edges.to(device, non_blocking=True)
 
-        # ✅ SBFT: probabilistic low-pass blur
-        if use_sbft and (np.random.rand() < sbft_prob):
-            images = lowpass_blur(images, kernel_size=sbft_kernel, sigma=sbft_sigma)
+        # EPSB：预测边界只用于构造训练期 FFT 门控，推理阶段不增加参数。
+        if use_epsb and (np.random.rand() < epsb_prob):
+            pred_preview = None
+            if epsb_use_pred_boundary:
+                was_training = model.training
+                model.eval()
+                with torch.no_grad():
+                    pred_preview = model(images)[4]
+                if was_training:
+                    model.train()
+            images = boundary_protected_frequency_gate(
+                images, gts, pred_logits=pred_preview,
+                cutoff_ratio=epsb_cutoff,
+                suppress_strength=epsb_suppress,
+                boundary_width=epsb_boundary_width,
+            )
 
         preds = model(images)
 
@@ -295,6 +271,7 @@ def train_one_epoch_anti_curri(
         )
         loss_final = structure_loss(preds[4], gts).mean()
         loss_edge = (
+            dice_loss(preds[5], edges) * 0.0625 +
             dice_loss(preds[6], edges) * 0.125 +
             dice_loss(preds[7], edges) * 0.25 +
             dice_loss(preds[8], edges) * 0.5
@@ -334,7 +311,7 @@ if __name__ == '__main__':
 
     parser = argparse.ArgumentParser()
 
-    # training basic
+    # 训练参数
     parser.add_argument('--epoch', type=int, default=100, help='anti-curri total epochs')
     parser.add_argument('--lr', type=float, default=5e-5, help='finetune learning rate')
     parser.add_argument('--batchsize', type=int, default=36, help='training batch size')
@@ -342,28 +319,32 @@ if __name__ == '__main__':
     parser.add_argument('--clip', type=float, default=0.5, help='gradient clipping margin')
     parser.add_argument('--gpu_id', type=str, default='0', help='train use gpu')
 
-    # paths
+    # 路径参数
     parser.add_argument('--train_root', type=str, default='',
-                        help='training dataset root (contains Imgs/ GT/ Edge/)')
+                        help='息肉训练集目录（包含 Imgs/ 和 GT/，Edge/ 可省略）')
     parser.add_argument('--val_root', type=str, default='',
-                        help='validation dataset root (contains Imgs/ GT/)')
+                        help='息肉验证集目录（包含 Imgs/ 和 GT/）')
     parser.add_argument('--save_path', type=str, default='',
                         help='path to save model and log')
     parser.add_argument('--load', type=str, default='',
                         help='path to load ckpt (your bestMAE model, e.g., Net_epoch_best.pth)')
 
-    # anti-curri params
+    # 反课程参数
     parser.add_argument('--hard_ratio', type=float, default=0.2,
                         help='hardest ratio used for anti-curri')
     parser.add_argument('--recompute_diff_every', type=int, default=0,
                         help='recompute difficulty every N epochs')
+    parser.add_argument('--prior_weight', type=float, default=0.35,
+                        help='息肉医学域先验权重；设为 0 可做无先验基线')
     parser.add_argument('--num_workers', type=int, default=16, help='dataloader workers')
 
-    # SBFT
-    parser.add_argument('--use_sbft', action='store_true', help='enable SBFT low-pass blur')
-    parser.add_argument('--sbft_prob', type=float, default=0.7, help='probability of SBFT per batch')
-    parser.add_argument('--sbft_kernel', type=int, default=11, help='gaussian blur kernel size (odd)')
-    parser.add_argument('--sbft_sigma', type=float, default=3.0, help='gaussian blur sigma')
+    # EPSB (Boundary-protected frequency fine-tuning)
+    parser.add_argument('--no_epsb', action='store_true', help='消融时关闭 EPSB')
+    parser.add_argument('--epsb_prob', type=float, default=0.7, help='每个 batch 使用 EPSB 的概率')
+    parser.add_argument('--epsb_cutoff', type=float, default=0.18, help='径向低通截止比例')
+    parser.add_argument('--epsb_suppress', type=float, default=0.75, help='边界外高频抑制强度')
+    parser.add_argument('--epsb_boundary_width', type=int, default=2, help='边界保护带半径（像素）')
+    parser.add_argument('--epsb_no_pred_boundary', action='store_true', help='只使用 GT 边界的低成本消融')
 
     opt = parser.parse_args()
 
@@ -381,10 +362,11 @@ if __name__ == '__main__':
         datefmt='%Y-%m-%d %I:%M:%S %p'
     )
 
-    logging.info('Anti-Curriculum Stage Start')
+    logging.info('PolypCurriSeg 阶段二：hard-subset + EPSB')
     logging.info(
         f'Config: epoch={opt.epoch} lr={opt.lr} batchsize={opt.batchsize} trainsize={opt.trainsize} '
-        f'hard_ratio={opt.hard_ratio} use_sbft={opt.use_sbft} load={opt.load}'
+        f'hard_ratio={opt.hard_ratio} prior_weight={opt.prior_weight} '
+        f'use_epsb={not opt.no_epsb} load={opt.load}'
     )
 
     # Build model
@@ -461,7 +443,7 @@ if __name__ == '__main__':
         shuffle=True,
         num_workers=opt.num_workers,
         pin_memory=True,
-        drop_last=True
+        drop_last=False
     )
 
     # Train anti-curri
@@ -487,7 +469,7 @@ if __name__ == '__main__':
                 shuffle=True,
                 num_workers=opt.num_workers,
                 pin_memory=True,
-                drop_last=True
+                drop_last=False
             )
 
             summarize_difficulty(d_map, tag=f"epoch={epoch}")
@@ -500,10 +482,12 @@ if __name__ == '__main__':
             optimizer=optimizer,
             epoch=epoch,
             writer=writer,
-            use_sbft=opt.use_sbft,
-            sbft_prob=opt.sbft_prob,
-            sbft_kernel=opt.sbft_kernel,
-            sbft_sigma=opt.sbft_sigma
+            use_epsb=not opt.no_epsb,
+            epsb_prob=opt.epsb_prob,
+            epsb_cutoff=opt.epsb_cutoff,
+            epsb_suppress=opt.epsb_suppress,
+            epsb_boundary_width=opt.epsb_boundary_width,
+            epsb_use_pred_boundary=not opt.epsb_no_pred_boundary,
         )
 
         # Validate every epoch
